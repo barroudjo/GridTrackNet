@@ -1,0 +1,6 @@
+Sample Video's/*
+__pycache__
+# Build artifacts — machine/TensorRT-version specific; rebuild locally.
+*.trt
+# ONNX is portable but large (34 MB); regenerate with export_onnx.py.
+*.onnx

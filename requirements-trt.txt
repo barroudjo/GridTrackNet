@@ -1,0 +1,27 @@
+# GridTrackNet -- TensorRT inference-only environment (no TensorFlow).
+# Runs Predict.py with the TensorRT backend on a prebuilt engine
+# (trt/gridtracknet_fp16.trt). Installs in one clean pass:
+#   pip install -r requirements-trt.txt
+#
+# Scope:
+#   - Inference only. For training / dataset generation / exporting a NEW engine
+#     from updated weights, use requirements.txt (TensorFlow, Python 3.10).
+#   - Rebuilding the engine from the existing trt/gridtracknet.onnx (e.g. after a
+#     TensorRT upgrade or on a different GPU) needs only onnx + onnxconverter-common
+#     + tensorrt -- still no TensorFlow. See trt/README.md.
+#
+# Python: 3.10 (verified). For Python 3.12, bump numpy>=1.26 and
+#   opencv-python>=4.8.1 (the only two pins below without 3.12 wheels); the
+#   tensorrt / cuda-python wheels already ship 3.12 builds.
+#
+# Requires an NVIDIA GPU + driver supporting CUDA 13. TensorRT libs are ~3.7 GB.
+
+# --- Direct inference imports (Predict.py / trt_runner.py) ---
+numpy==1.24.2
+opencv-python==4.7.0.72
+
+# --- TensorRT FP16 runtime ---
+# tensorrt pulls tensorrt_cu13 + _libs + _bindings (all pinned to ==11.1.0.106);
+# cuda-python pulls cuda-bindings + cuda-core + cuda-pathfinder + backports.strenum.
+tensorrt==11.1.0.106
+cuda-python==13.3.1
