@@ -23,6 +23,9 @@ DEFAULT_ENGINE = os.path.join(REPO_ROOT, "trt", "gridtracknet_fp16.trt")
 # (N,15,27,48) grid output. Chosen lazily so the TensorRT path needs no TensorFlow.
 _infer = None
 _backend_name = None
+# The underlying TRTRunner when the TensorRT backend is active, exposed so the
+# DALI decoder can feed GPU buffers zero-copy via runner.infer_device().
+_trt_runner = None
 
 # Cumulative per-stage wall-clock (seconds), used to locate pipeline bottlenecks.
 # Reset per video by process_video(); updated by getPredictions() and the main loop.
@@ -44,10 +47,12 @@ def _init_keras_backend(weights):
 
 
 def _init_trt_backend(engine):
+    global _trt_runner
     if REPO_ROOT not in sys.path:
         sys.path.insert(0, REPO_ROOT)
     from trt.trt_runner import TRTRunner
     runner = TRTRunner(engine)
+    _trt_runner = runner
     return lambda units: runner.infer(units)
 
 
@@ -103,17 +108,10 @@ def _preprocess_unit(frames, isBGRFormat=False):
     return unit
 
 
-def _infer_and_decode(units, outputWidth, outputHeight):
-    """Run the model on a batch of units (N, 15, HEIGHT, WIDTH) and decode the grid
-    output into a flat list of (x, y) ball coordinates, 5 per unit in frame order.
-    (0,0) marks 'no ball'. Coordinates are scaled to the output resolution."""
-    if _infer is None:
-        init_backend()
-    t0 = time.time()
-    y_pred = _infer(units)
-    STAGE_TIMES["infer"] += time.time() - t0
-
-    t0 = time.time()
+def decodeGrid(y_pred, outputWidth, outputHeight):
+    """Decode the raw model output (N, 15, GRID_ROWS, GRID_COLS) into a flat list of
+    (x, y) ball coordinates, 5 per unit in frame order. (0,0) marks 'no ball'.
+    Pure NumPy on the host output grid, so it's shared by the CPU and DALI paths."""
     y_pred = np.split(y_pred, IMGS_PER_INSTANCE, axis=1)
     y_pred = np.stack(y_pred, axis=2)
     y_pred = np.moveaxis(y_pred, 1, -1)
@@ -148,6 +146,20 @@ def _infer_and_decode(units, outputWidth, outputHeight):
             else:
                 ballCoordinates.append((0,0))
 
+    return ballCoordinates
+
+
+def _infer_and_decode(units, outputWidth, outputHeight):
+    """Run the model on a batch of units (N, 15, HEIGHT, WIDTH) and decode the grid
+    output into a flat list of (x, y) ball coordinates, 5 per unit in frame order."""
+    if _infer is None:
+        init_backend()
+    t0 = time.time()
+    y_pred = _infer(units)
+    STAGE_TIMES["infer"] += time.time() - t0
+
+    t0 = time.time()
+    ballCoordinates = decodeGrid(y_pred, outputWidth, outputHeight)
     STAGE_TIMES["postprocess"] += time.time() - t0
     return ballCoordinates
 
@@ -433,6 +445,232 @@ def process_video(video_path, display_trail=True, output_suffix=OUTPUT_SUFFIX, w
     return output_path, detections_path
 
 
+def process_video_dali(video_path, display_trail=True, output_suffix=OUTPUT_SUFFIX,
+                       write_video=True, batch_size=4):
+    """GPU-resident variant of process_video: NVIDIA DALI hardware-decodes (NVDEC)
+    and preprocesses on the GPU, then the units are fed zero-copy into TensorRT.
+    For video output the original full-res frames are also produced (copied back to
+    the host) so the same annotation + encode can run. Requires the TensorRT backend
+    (an engine) and nvidia-dali; otherwise identical outputs to process_video."""
+    if _trt_runner is None:
+        raise RuntimeError(
+            "--decoder dali requires the TensorRT backend. Build an engine and run "
+            "with --backend trt (the DALI path feeds GPU buffers via infer_device)."
+        )
+    from nvidia.dali import pipeline_def, fn, types
+    from cuda.bindings import runtime as cudart
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f"Error opening video file: {video_path}")
+        return None
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.release()
+    if 57 <= fps <= 62:
+        numFramesSkip = 2
+    elif 22 <= fps <= 32:
+        numFramesSkip = 1
+    else:
+        print(f"ERROR: '{video_path}' is not 30FPS or 60FPS (got {fps}); skipping")
+        return None
+
+    batch_size = max(1, min(batch_size, _trt_runner.max_batch))
+
+    directory, filename = os.path.split(video_path)
+    name, extension = os.path.splitext(filename)
+    detections_path = os.path.join(directory, f"{name} Predicted {output_suffix} detections.csv")
+
+    output_path = None
+    video_writer = None
+    if write_video:
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        output_filename = f"{name} Predicted {output_suffix}{extension}"
+        output_path = os.path.join(directory, output_filename)
+        outputFPS = int(fps) if numFramesSkip == 1 else 30
+        video_writer = cv2.VideoWriter(output_path, fourcc, outputFPS, (frame_width, frame_height))
+
+    det_file = open(detections_path, "w")
+    det_file.write("frame,visibility,x,y\n")
+    dest = output_filename if write_video else os.path.basename(detections_path) + " (CSV only)"
+    print(f"\n[{filename}] -> {dest}  [decoder=dali/NVDEC]")
+
+    need_frames = write_video
+
+    # NVDEC-decode 5-frame units (stride = frame-skip, step = 5*stride for
+    # non-overlapping units), resize to the model size, convert RGB->BGR to match
+    # the CPU path, normalize to CHW float. For video we also emit the original
+    # full-res frames (as BGR) for annotation/encode.
+    @pipeline_def(batch_size=batch_size, num_threads=3, device_id=0, prefetch_queue_depth=2)
+    def _pipe():
+        full = fn.readers.video(
+            device="gpu", filenames=[video_path], sequence_length=5,
+            stride=numFramesSkip, step=5 * numFramesSkip, image_type=types.RGB,
+            skip_vfr_check=True, pad_last_batch=True, name="reader",
+        )
+        small = fn.resize(full, resize_x=WIDTH, resize_y=HEIGHT)
+        small = fn.color_space_conversion(small, image_type=types.RGB, output_type=types.BGR)
+        units = fn.crop_mirror_normalize(
+            small, dtype=types.FLOAT, output_layout="FCHW", mean=[0.0], std=[255.0])
+        units = fn.reshape(units, shape=[15, HEIGHT, WIDTH])
+        if need_frames:
+            return units, fn.color_space_conversion(full, image_type=types.RGB, output_type=types.BGR)
+        return units
+
+    pipe = _pipe()
+    pipe.build()
+    seq_count = int(pipe.epoch_size("reader"))   # number of 5-frame units in one pass
+    iters = (seq_count + batch_size - 1) // batch_size
+    totalFrames = seq_count * 5
+
+    # Writer thread (annotate + encode) so the CPU encode overlaps GPU inference.
+    SENTINEL = None
+    write_q = queue.Queue(maxsize=8) if write_video else None
+    t_write = {"s": 0.0}
+
+    def writer():
+        history = []
+        while True:
+            item = write_q.get()
+            if item is SENTINEL:
+                break
+            unit_frames, coords = item
+            t = time.time()
+            history.extend(coords)
+            for i, frame in enumerate(unit_frames):
+                if i < len(coords):
+                    if display_trail:
+                        if len(history) >= 15:
+                            for j in range(7, -1, -2):
+                                k = len(history) - 5 - j + i
+                                cv2.circle(frame, history[k], 4, (0, 255, 255), -1)
+                    else:
+                        cv2.circle(frame, coords[i], 8, (0, 0, 255), 4)
+                video_writer.write(frame)
+            t_write["s"] += time.time() - t
+
+    wr_thread = None
+    if write_video:
+        wr_thread = threading.Thread(target=writer, daemon=True)
+        wr_thread.start()
+
+    gpu = _GPUStats()
+
+    def _cuda(ret):
+        err, *rest = ret if isinstance(ret, (tuple, list)) else (ret,)
+        if err != cudart.cudaError_t.cudaSuccess:
+            raise RuntimeError(f"CUDA error: {int(err)}")
+        return rest[0] if len(rest) == 1 else None
+
+    # GPU buffer pool: the producer copies each batch of units into a free pool
+    # buffer (cheap device-to-device), so DALI can immediately reuse its own output
+    # buffer to decode the NEXT batch while TensorRT still reads this one. This is
+    # what lets NVDEC decode overlap TRT inference instead of running serially.
+    unit_nbytes = batch_size * 15 * HEIGHT * WIDTH * 4
+    POOL = 4
+    pool = [_cuda(cudart.cudaMalloc(unit_nbytes)) for _ in range(POOL)]
+    free_q = queue.Queue()
+    for s in range(POOL):
+        free_q.put(s)
+    work_q = queue.Queue(maxsize=POOL)
+    DtoD = cudart.cudaMemcpyKind.cudaMemcpyDeviceToDevice
+
+    t_dali = {"s": 0.0}      # producer-thread busy time (decode + preproc + copy)
+    t_infer = 0.0            # consumer (main) inference time
+    t_decode = 0.0           # grid decode
+
+    def producer():
+        produced = 0
+        for _ in range(iters):
+            t = time.time()
+            out = pipe.run()
+            units_t = out[0].as_tensor()
+            cudart.cudaDeviceSynchronize()   # DALI ready; inference still overlaps (separate thread)
+            slot = free_q.get()              # blocks (backpressure) until a buffer frees
+            _cuda(cudart.cudaMemcpy(pool[slot], units_t.data_ptr(), unit_nbytes, DtoD))
+            shape = tuple(int(s) for s in units_t.shape())
+            # Copy the full-res frames to host once (decoupled from DALI's reused
+            # buffer); the writer slices them later.
+            frames = np.array(out[1].as_cpu().as_array()) if write_video else None
+            t_dali["s"] += time.time() - t
+            real = min(batch_size, seq_count - produced)   # drop padded tail
+            produced += real
+            work_q.put((slot, shape, frames, real))
+        work_q.put(SENTINEL)
+
+    prod_thread = threading.Thread(target=producer, daemon=True)
+    prod_thread.start()
+
+    outFrameIdx = 0
+    last_report = time.time()
+    last_frames = 0
+    status = ""
+    start_time = time.time()
+    while True:
+        item = work_q.get()
+        if item is SENTINEL:
+            break
+        slot, shape, frames, real = item
+
+        t = time.time()
+        y_pred = _trt_runner.infer_device(pool[slot], shape)
+        t_infer += time.time() - t
+        free_q.put(slot)                     # input consumed; buffer reusable now
+
+        t = time.time()
+        coords = decodeGrid(y_pred, frame_width, frame_height)
+        t_decode += time.time() - t
+
+        if write_video:
+            for g in range(real):
+                group = [frames[g, i] for i in range(5)]   # frames is a fresh per-batch copy
+                write_q.put((group, coords[g * 5:(g + 1) * 5]))
+        for x, yy in coords[:real * 5]:
+            det_file.write(f"{outFrameIdx},{0 if (x == 0 and yy == 0) else 1},{x},{yy}\n")
+            outFrameIdx += 1
+
+        now = time.time()
+        if now - last_report >= 0.5:
+            fps_now = (outFrameIdx - last_frames) / (now - last_report)
+            last_report, last_frames = now, outFrameIdx
+            sample = gpu.sample()
+            if sample is not None:
+                util, used, total = sample
+                status = f" | {fps_now:6.1f} fps | GPU {util:3d}% | Mem {used}/{total} MB"
+            else:
+                status = f" | {fps_now:6.1f} fps"
+        pct = outFrameIdx * 100 / totalFrames if totalFrames else 0
+        print('Exporting...[%3d%%]%s   \r' % (int(pct), status), end="")
+
+    prod_thread.join()
+    if write_video:
+        write_q.put(SENTINEL)
+        wr_thread.join()
+    print("\nDone")
+
+    for b in pool:
+        cudart.cudaFree(b)
+
+    elapsed = time.time() - start_time
+    n = max(outFrameIdx, 1)
+    print(f"Processed {outFrameIdx} frames in {elapsed:.1f}s "
+          f"({outFrameIdx/elapsed:.1f} fps avg, batch={batch_size}, decoder=dali, overlapped)")
+    # Stages run on separate threads, so busy% overlaps (can exceed 100%); the
+    # largest is the throughput-limiting one (NVDEC decode for this workload).
+    print(f"  dali decode+preproc (producer) {t_dali['s']:6.2f}s  {t_dali['s']/elapsed*100:5.1f}% busy  {t_dali['s']/n*1000:6.2f} ms/fr")
+    print(f"  inference           (consumer) {t_infer:6.2f}s  {t_infer/elapsed*100:5.1f}% busy  {t_infer/n*1000:6.2f} ms/fr")
+    if write_video:
+        print(f"  write               (writer)   {t_write['s']:6.2f}s  {t_write['s']/elapsed*100:5.1f}% busy  {t_write['s']/n*1000:6.2f} ms/fr")
+
+    gpu.close()
+    det_file.close()
+    if video_writer is not None:
+        video_writer.release()
+    cv2.destroyAllWindows()
+    return output_path, detections_path
+
+
 def _gather_videos(path):
     """Resolve a path to a list of source .mp4 videos. A directory yields every
     .mp4 that isn't an already-predicted output."""
@@ -459,6 +697,7 @@ if __name__ == "__main__":
     parser.add_argument('--output_suffix', required=False, default=OUTPUT_SUFFIX, type=str, help=f"Suffix appended to output file names. Default = {OUTPUT_SUFFIX}")
     parser.add_argument('--no_video', required=False, action="store_true", help="Skip writing the annotated video; only produce the detections .csv (much faster).")
     parser.add_argument('--batch', required=False, default=4, type=int, help="Number of 5-frame units per inference call (engine supports up to 16). Default = 4. NOTE: the current engine is built with opt batch=1, so larger batches give little/no gain until decode moves off-CPU or the engine is rebuilt with a larger opt profile.")
+    parser.add_argument('--decoder', required=False, default="cv2", choices=["cv2", "dali"], help="Frame decode + preprocess path. 'cv2' = CPU OpenCV pipeline (default). 'dali' = GPU NVDEC decode + GPU preprocess fed zero-copy into TensorRT (requires --backend trt and nvidia-dali).")
 
     args = parser.parse_args()
 
@@ -467,19 +706,23 @@ if __name__ == "__main__":
     WRITE_VIDEO = not args.no_video
     BATCH_SIZE = max(1, args.batch)
 
-    init_backend(args.backend, weights=MODEL_DIR, engine=args.engine)
+    # The DALI decoder feeds GPU buffers straight into the engine, so it requires
+    # the TensorRT backend regardless of --backend.
+    backend = "trt" if args.decoder == "dali" else args.backend
+    init_backend(backend, weights=MODEL_DIR, engine=args.engine)
 
     videos = _gather_videos(args.video_dir)
     if not videos:
         print(f"No source videos found at: {args.video_dir}")
         sys.exit(1)
 
-    print(f"Processing {len(videos)} video(s):")
+    print(f"Processing {len(videos)} video(s) [decoder={args.decoder}]:")
     for v in videos:
         print(f"  - {os.path.basename(v)}")
 
+    run = process_video_dali if args.decoder == "dali" else process_video
     for v in videos:
-        process_video(v, display_trail=DISPLAY_TRAIL, output_suffix=args.output_suffix,
-                      write_video=WRITE_VIDEO, batch_size=BATCH_SIZE)
+        run(v, display_trail=DISPLAY_TRAIL, output_suffix=args.output_suffix,
+            write_video=WRITE_VIDEO, batch_size=BATCH_SIZE)
 
     print("\nAll videos processed.")

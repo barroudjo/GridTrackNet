@@ -83,6 +83,27 @@ class TRTRunner:
         _check(cudart.cudaStreamSynchronize(self.stream))
         return out
 
+    def infer_device(self, dev_ptr, shape):
+        """Zero-copy inference from an already-on-GPU input. dev_ptr is a CUDA device
+        pointer (int) to a contiguous float32 (N, 15, 432, 768) buffer; the caller must
+        ensure it's fully produced (synchronized) before calling. Only the small output
+        grid is copied back to host. Requires N <= max_batch."""
+        n = int(shape[0])
+        if n > self.max_batch:
+            raise ValueError(f"batch {n} exceeds engine max_batch {self.max_batch}")
+        self.context.set_input_shape(self.input_name, tuple(int(s) for s in shape))
+        out_shape = tuple(self.context.get_tensor_shape(self.output_name))
+        out = np.empty(out_shape, dtype=np.float32)
+        self._d_out, self._out_cap = self._device_buf(self._d_out, self._out_cap, out.nbytes)
+
+        self.context.set_tensor_address(self.input_name, int(dev_ptr))
+        self.context.set_tensor_address(self.output_name, int(self._d_out))
+        if not self.context.execute_async_v3(self.stream):
+            raise RuntimeError("execute_async_v3 failed")
+        _check(cudart.cudaMemcpyAsync(out.ctypes.data, self._d_out, out.nbytes, _DtoH, self.stream))
+        _check(cudart.cudaStreamSynchronize(self.stream))
+        return out
+
     def close(self):
         for ptr in (self._d_in, self._d_out):
             if ptr is not None:
