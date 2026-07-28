@@ -4,3 +4,6 @@ __pycache__
 *.trt
 # ONNX is portable but large (34 MB); regenerate with export_onnx.py.
 *.onnx
+
+# Generated dataset (frames, clips, TFRecords) — large, regenerate with AutoLabel/
+Dataset/
