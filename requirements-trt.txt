@@ -17,8 +17,8 @@
 # Requires an NVIDIA GPU + driver supporting CUDA 13. TensorRT libs are ~3.7 GB.
 
 # --- Direct inference imports (Predict.py / trt_runner.py) ---
-numpy==1.24.2
-opencv-python==4.7.0.72
+numpy==2.2.6
+opencv-python-headless==4.11.0.86
 
 # --- TensorRT FP16 runtime ---
 # tensorrt pulls tensorrt_cu13 + _libs + _bindings (all pinned to ==11.1.0.106);
