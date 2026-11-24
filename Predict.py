@@ -441,7 +441,7 @@ def process_video(video_path, display_trail=True, output_suffix=OUTPUT_SUFFIX, w
     if video_writer is not None:
         video_writer.release()
     det_file.close()
-    cv2.destroyAllWindows()
+    #cv2.destroyAllWindows()
     return output_path, detections_path
 
 
@@ -667,7 +667,7 @@ def process_video_dali(video_path, display_trail=True, output_suffix=OUTPUT_SUFF
     det_file.close()
     if video_writer is not None:
         video_writer.release()
-    cv2.destroyAllWindows()
+    #cv2.destroyAllWindows()
     return output_path, detections_path
 
 
